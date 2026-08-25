@@ -12,8 +12,11 @@ export default function StructureView({ metadata, onColumnClick }: StructureView
   const fileMetadata: ParquetFileMetadata = metadata.fileMetadata;
   const rowGroups: RowGroupMetadata[] = metadata.rowGroups;
 
-  // État pour gérer les sections réduites
-  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set())
+  // The header is layout item 0, so row-group section IDs start at 1.
+  // Collapse every row group initially to keep large files scannable.
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
+    () => new Set(rowGroups.map((_rowGroup, rowGroupIndex) => `rowgroup-${rowGroupIndex + 1}`))
+  )
 
   // Fonction pour basculer l'état réduit/développé
   const toggleCollapse = (sectionId: string) => {
