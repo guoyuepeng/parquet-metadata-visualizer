@@ -103,6 +103,11 @@
   font-weight: 600;
 }
 
+.mono-value {
+  font-family: 'Courier New', monospace;
+  overflow-wrap: anywhere;
+}
+
 .encoding-stats {
   display: flex;
   gap: 1rem;
@@ -158,6 +163,250 @@
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
 
+.section-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.section-title-row h3 {
+  margin-bottom: 0.35rem;
+}
+
+.section-helper-text {
+  max-width: 850px;
+  margin: 0;
+  color: #5f6368;
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+.format-doc-link {
+  flex: 0 0 auto;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid #c7c9ff;
+  border-radius: 6px;
+  background-color: #f5f5ff;
+  color: #4b52cc;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.format-doc-link:hover {
+  border-color: #646cff;
+  color: #343bb5;
+}
+
+.page-details-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.page-card.detailed {
+  padding: 0;
+  overflow: hidden;
+  border-left: 5px solid #9e9e9e;
+}
+
+.page-card.detailed.data_page {
+  border-left-color: #1976d2;
+}
+
+.page-card.detailed.data_page_v2 {
+  border-left-color: #00796b;
+}
+
+.page-card.detailed.dictionary_page {
+  border-left-color: #7b1fa2;
+}
+
+.page-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 1.15rem;
+  border-bottom: 1px solid #e0e0e0;
+  background-color: #fcfcfc;
+}
+
+.page-card-title {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.page-range {
+  color: #4b5563;
+  font: 600 0.83rem 'Courier New', monospace;
+  white-space: nowrap;
+}
+
+.page-byte-layout {
+  display: grid;
+  grid-template-columns: minmax(155px, 0.35fr) auto minmax(220px, 1fr);
+  align-items: stretch;
+  gap: 0.65rem;
+  padding: 1rem 1.15rem 0;
+}
+
+.page-layout-segment {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 6px;
+  border: 1px solid;
+}
+
+.page-layout-segment span {
+  color: #555;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.page-layout-segment strong {
+  color: #263238;
+  font-size: 1rem;
+}
+
+.page-layout-segment small {
+  color: #687076;
+  font-family: 'Courier New', monospace;
+}
+
+.header-segment {
+  border-color: #bdbdbd;
+  background-color: #f1f3f4;
+}
+
+.payload-segment {
+  border-color: #b8c5ff;
+  background-color: #eef1ff;
+}
+
+.page-layout-arrow {
+  display: flex;
+  align-items: center;
+  color: #7b8194;
+  font-size: 1.25rem;
+}
+
+.page-metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+  gap: 0;
+  margin: 1rem 1.15rem;
+  border: 1px solid #e3e5e8;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.page-metadata-grid.compact {
+  margin: 0;
+}
+
+.page-metadata-field {
+  min-width: 0;
+  padding: 0.7rem 0.8rem;
+  border-right: 1px solid #eceff1;
+  border-bottom: 1px solid #eceff1;
+  background-color: white;
+}
+
+.page-metadata-field.wide {
+  grid-column: 1 / -1;
+}
+
+.page-metadata-field dt {
+  margin-bottom: 0.2rem;
+  color: #6b7280;
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+
+.page-metadata-field dd {
+  margin: 0;
+  color: #263238;
+  font: 600 0.85rem 'Courier New', monospace;
+  overflow-wrap: anywhere;
+}
+
+.page-specific-block {
+  margin: 1rem 1.15rem;
+  padding: 0.9rem;
+  border: 1px solid #dfe3e8;
+  border-radius: 7px;
+  background-color: #fafbfc;
+}
+
+.page-specific-block h5 {
+  margin: 0 0 0.7rem;
+  color: #374151;
+  font-size: 0.9rem;
+}
+
+.dictionary-metadata {
+  border-color: #d7b8df;
+  background-color: #fbf5fc;
+}
+
+.dictionary-metadata h5 {
+  color: #6a1b7a;
+}
+
+.data-page-metadata {
+  border-color: #b8d9f3;
+  background-color: #f4f9fd;
+}
+
+.data-page-v2-metadata {
+  border-color: #a9d8d1;
+  background-color: #f1faf8;
+}
+
+.page-payload-breakdown {
+  border-color: #d9dcff;
+  background-color: #f7f7ff;
+}
+
+.page-statistics-block {
+  border-color: #d8dee5;
+  background-color: #f8fafc;
+}
+
+.column-index-statistics-block {
+  border-color: #c7d2fe;
+  background-color: #f5f7ff;
+}
+
+.column-index-statistics-block h5 {
+  color: #3730a3;
+}
+
+.page-error {
+  border-color: #ef9a9a;
+  background-color: #fff5f5;
+  color: #8b1d1d;
+}
+
+.page-error h3,
+.page-error p {
+  color: inherit;
+}
+
+.page-error p {
+  margin-bottom: 0;
+}
+
 .page-header {
   display: flex;
   gap: 0.75rem;
@@ -183,6 +432,11 @@
 .page-type.data_page {
   background-color: #e3f2fd;
   color: #1976d2;
+}
+
+.page-type.data_page_v2 {
+  background-color: #e0f2f1;
+  color: #00796b;
 }
 
 .page-type.dictionary_page {
@@ -295,6 +549,11 @@
 .page-type-badge.data_page {
   background-color: #e3f2fd;
   color: #1976d2;
+}
+
+.page-type-badge.data_page_v2 {
+  background-color: #e0f2f1;
+  color: #00796b;
 }
 
 .page-type-badge.dictionary_page {
@@ -748,4 +1007,31 @@
   color: #f57f17;
   font-size: 1.1rem;
   font-weight: 500;
+}
+
+@media (max-width: 720px) {
+  .section-title-row,
+  .page-card-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .format-doc-link,
+  .page-range {
+    align-self: flex-start;
+    white-space: normal;
+  }
+
+  .page-byte-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .page-layout-arrow {
+    justify-content: center;
+    transform: rotate(90deg);
+  }
+
+  .page-metadata-grid {
+    grid-template-columns: 1fr;
+  }
 }

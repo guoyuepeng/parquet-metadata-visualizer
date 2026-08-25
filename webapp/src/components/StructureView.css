@@ -1,5 +1,6 @@
 .structure-view {
   padding: 1.5rem;
+  color: #333;
 }
 
 .structure-header {
@@ -80,6 +81,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  color: #4b5563;
 }
 
 .section-header .section-label {
@@ -103,6 +105,7 @@
   margin-right: 8px;
   font-family: monospace;
   user-select: none;
+  color: #5f6368;
 }
 
 .section-label {

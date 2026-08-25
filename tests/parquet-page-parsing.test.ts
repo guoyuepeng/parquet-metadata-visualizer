@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { openSync, readSync, fstatSync, closeSync, readdirSync } from 'fs'
 import { join } from 'path'
-import { parseParquetPage } from '../src/lib/parquet-parsing-core.js'
+import { decompressPagePayload, parseParquetColumnIndex, parseParquetPage } from '../src/lib/parquet-parsing-core.js'
 import { readParquetPagesFromFile } from '../src/lib/parquet-parsing-node.js'
 
 describe('parseParquetPage', () => {
@@ -55,6 +55,25 @@ describe('parseParquetPage', () => {
         const pageTypes = pages.map(p => p.pageType)
         expect(pageTypes).toContain('DICTIONARY_PAGE')
         expect(pageTypes).toContain('DATA_PAGE')
+
+        const dictionaryPage = pages.find(page => page.pageType === 'DICTIONARY_PAGE')
+        expect(dictionaryPage?.dictionaryPageHeader).toBeDefined()
+        expect(dictionaryPage?.dictionaryPageHeader?.num_values).toBeGreaterThan(0)
+        expect(dictionaryPage?.dictionaryPageHeader?.encoding).toBeTypeOf('string')
+
+        const dataPages = pages.filter(page => page.pageType === 'DATA_PAGE')
+        expect(dataPages[0]?.dataPageIndex).toBe(0)
+        expect(dataPages[0]?.dataPageHeader).toBeDefined()
+        expect(dataPages[0]?.dataPageHeader?.num_values).toBeGreaterThan(0)
+        expect(dataPages[0]?.dataPageHeader?.definition_level_encoding).toBeTypeOf('string')
+        expect(dataPages[0]?.dataPageHeader?.repetition_level_encoding).toBeTypeOf('string')
+
+        // Column total_compressed_size includes each page header and payload.
+        const totalOnDiskSize = pages.reduce(
+          (sum, page) => sum + (page.headerSize ?? 0) + (page.compressedSize ?? 0),
+          0
+        )
+        expect(totalOnDiskSize).toBe(Number(firstColumnChunk.meta_data.total_compressed_size))
       } finally {
         close()
       }
@@ -238,7 +257,11 @@ describe('parseParquetPage', () => {
             const { reader, close } = createByteRangeReader(filePath)
 
             try {
-              const pages = await parseParquetPage(columnChunk, reader)
+              const pages = await parseParquetPage(
+                columnChunk,
+                reader,
+                metadata.fileMetadata.schema
+              )
 
               // Should have parsed at least one page
               expect(pages.length).toBeGreaterThan(0)
@@ -270,6 +293,14 @@ describe('parseParquetPage', () => {
               // Offsets should be increasing
               for (let i = 1; i < pages.length; i++) {
                 expect(Number(pages[i].offset)).toBeGreaterThan(Number(pages[i-1].offset))
+              }
+
+              if (columnChunk.column_index_offset !== undefined) {
+                const dataPages = pages.filter(
+                  page => page.pageType === 'DATA_PAGE' || page.pageType === 'DATA_PAGE_V2'
+                )
+                expect(dataPages.length).toBeGreaterThan(0)
+                dataPages.forEach(page => expect(page.columnIndex).toBeDefined())
               }
 
               successfulParses++
@@ -321,5 +352,77 @@ describe('parseParquetPage', () => {
         close()
       }
     })
+  })
+})
+
+describe('parseParquetColumnIndex', () => {
+  it('decodes typed min/max bounds and null counts without a tracked Parquet fixture', () => {
+    // CompactProtocol ColumnIndex with three INT32 page entries.
+    const encodedColumnIndex = Uint8Array.from([
+      25, 49, 2, 2, 2,
+      25, 56, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, 0, 0, 0, 0,
+      25, 56, 4, 99, 0, 0, 0, 4, 99, 0, 0, 0, 4, 99, 0, 0, 0,
+      21, 2,
+      25, 54, 24, 22, 16,
+      41, 102, 24, 232, 2, 22, 234, 2, 16, 240, 1,
+      0,
+    ])
+    const schema = [
+      { repetition_type: 'REQUIRED', name: 'schema', num_children: 1 },
+      { type: 'INT32', repetition_type: 'OPTIONAL', name: 'id' },
+    ] as any
+
+    const entries = parseParquetColumnIndex(encodedColumnIndex.buffer, schema, ['id'])
+
+    expect(entries).toHaveLength(3)
+    expect(entries.map(entry => entry.index)).toEqual([0, 1, 2])
+    expect(entries.map(entry => entry.min)).toEqual([0, 0, 0])
+    expect(entries.map(entry => entry.max)).toEqual([99, 99, 99])
+    expect(entries.map(entry => entry.nullCount)).toEqual([12n, 11n, 8n])
+    expect(entries.every(entry => entry.nullPage === false)).toBe(true)
+    expect(entries.every(entry => entry.boundaryOrder === 'ASCENDING')).toBe(true)
+  })
+})
+
+describe('decompressPagePayload', () => {
+  it('keeps uncompressed DATA_PAGE_V2 level and value sections intact', () => {
+    const payload = new Uint8Array([1, 2, 3, 4, 5])
+    const result = decompressPagePayload({
+      pageNumber: 0,
+      pageType: 'DATA_PAGE_V2',
+      compressedSize: payload.byteLength,
+      uncompressedSize: payload.byteLength,
+      dataPageHeaderV2: {
+        num_values: 3,
+        num_nulls: 0,
+        num_rows: 3,
+        encoding: 'PLAIN',
+        repetition_levels_byte_length: 1,
+        definition_levels_byte_length: 1,
+        is_compressed: false,
+      },
+    }, payload.buffer, 'GZIP')
+
+    expect(Array.from(result)).toEqual(Array.from(payload))
+  })
+
+  it('rejects invalid DATA_PAGE_V2 level lengths', () => {
+    const payload = new Uint8Array([1, 2])
+
+    expect(() => decompressPagePayload({
+      pageNumber: 0,
+      pageType: 'DATA_PAGE_V2',
+      compressedSize: payload.byteLength,
+      uncompressedSize: payload.byteLength,
+      dataPageHeaderV2: {
+        num_values: 1,
+        num_nulls: 0,
+        num_rows: 1,
+        encoding: 'PLAIN',
+        repetition_levels_byte_length: 2,
+        definition_levels_byte_length: 1,
+        is_compressed: true,
+      },
+    }, payload.buffer, 'UNCOMPRESSED')).toThrow('Invalid DATA_PAGE_V2 level lengths')
   })
 })

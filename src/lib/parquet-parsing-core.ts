@@ -8,9 +8,12 @@
 import { parquetMetadata, snappyUncompress } from 'hyparquet'
 import type { ColumnChunk, RowGroup } from 'hyparquet'
 import { deserializeTCompactProtocol } from 'hyparquet/src/thrift.js'
-import { PageType, Encoding } from 'hyparquet/src/constants.js'
+import { convertMetadata } from 'hyparquet/src/metadata.js'
+import { DEFAULT_PARSERS } from 'hyparquet/src/convert.js'
+import { getSchemaPath } from 'hyparquet/src/schema.js'
+import { PageType, Encoding, BoundaryOrder } from 'hyparquet/src/constants.js'
 import { decompress as zstdDecompress } from 'fzstd'
-import type { SchemaElement } from 'hyparquet/src/types.js'
+import type { BoundaryOrder as BoundaryOrderType, MinMaxType, SchemaElement, Statistics } from 'hyparquet/src/types.js'
 
 /**
  * File metadata extracted from the Parquet footer
@@ -38,22 +41,18 @@ export interface PageInfo {
   compressedSize?: number
   uncompressedSize?: number
   headerSize?: number
+  /** First row covered by this data page, populated from the optional OffsetIndex. */
   firstRowIndex?: bigint
   numValues?: number
   crc?: number
+  /** Zero-based data-page ordinal within the column chunk (dictionary pages excluded). */
+  dataPageIndex?: number
   dataPageHeader?: {
     num_values: number
     encoding: string
     definition_level_encoding: string
     repetition_level_encoding: string
-    statistics?: {
-      max?: any
-      min?: any
-      null_count?: number
-      distinct_count?: number
-      max_value?: any
-      min_value?: any
-    }
+    statistics?: Statistics
   }
   dictionaryPageHeader?: {
     num_values: number
@@ -68,8 +67,74 @@ export interface PageInfo {
     definition_levels_byte_length: number
     repetition_levels_byte_length: number
     is_compressed: boolean
-    statistics?: any
+    statistics?: Statistics
   }
+  /** Page size recorded by OffsetIndex, including the page header. */
+  offsetIndexCompressedSize?: number
+  /** Page-level value bounds and null metadata stored in the optional ColumnIndex. */
+  columnIndex?: ColumnIndexPageInfo
+}
+
+/** ColumnIndex entry corresponding to one data page. */
+export interface ColumnIndexPageInfo {
+  /** Zero-based entry ordinal; aligned with the data-page ordinal and OffsetIndex. */
+  index: number
+  /** Whether every value in this page is null. */
+  nullPage: boolean
+  /** Lower bound for non-null values in this page. */
+  min?: MinMaxType
+  /** Upper bound for non-null values in this page. */
+  max?: MinMaxType
+  /** Whether page bounds are unordered, ascending, or descending across the chunk. */
+  boundaryOrder: BoundaryOrderType
+  /** Number of null values in this page, when supplied by the writer. */
+  nullCount?: bigint
+  /** Number of NaN values in this page, when supplied by the writer. */
+  nanCount?: bigint
+}
+
+/**
+ * Deserialize a ColumnIndex payload into one typed entry per data page.
+ * When the file schema is unavailable, min/max bounds remain Uint8Array values.
+ */
+export function parseParquetColumnIndex(
+  columnIndexBuffer: ArrayBuffer,
+  fileSchema?: SchemaElement[],
+  columnPath?: string[]
+): ColumnIndexPageInfo[] {
+  const rawColumnIndex = deserializeTCompactProtocol({
+    view: new DataView(columnIndexBuffer),
+    offset: 0,
+  }) as {
+    field_1?: boolean[]
+    field_2?: Uint8Array[]
+    field_3?: Uint8Array[]
+    field_4?: number
+    field_5?: bigint[]
+    field_8?: bigint[]
+  }
+
+  let columnSchema: SchemaElement | undefined
+  if (fileSchema && columnPath) {
+    const schemaPath = getSchemaPath(fileSchema, columnPath)
+    columnSchema = schemaPath[schemaPath.length - 1]?.element
+  }
+
+  const decodeBound = (value: Uint8Array | undefined): MinMaxType | undefined => {
+    if (value === undefined || !columnSchema) return value
+    return convertMetadata(value, columnSchema, DEFAULT_PARSERS)
+  }
+  const boundaryOrder = (BoundaryOrder[rawColumnIndex.field_4 ?? 0] ?? 'UNORDERED') as BoundaryOrderType
+
+  return (rawColumnIndex.field_1 ?? []).map((nullPage, index) => ({
+    index,
+    nullPage,
+    min: nullPage ? undefined : decodeBound(rawColumnIndex.field_2?.[index]),
+    max: nullPage ? undefined : decodeBound(rawColumnIndex.field_3?.[index]),
+    boundaryOrder,
+    nullCount: rawColumnIndex.field_5?.[index],
+    nanCount: rawColumnIndex.field_8?.[index],
+  }))
 }
 
 /**
@@ -405,11 +470,13 @@ export async function parseParquetPageIndex(
  *
  * @param columnChunkMetadata - Metadata for the column chunk
  * @param readByteRange - Function to read arbitrary byte ranges
+ * @param fileSchema - Optional file schema used to decode typed ColumnIndex bounds
  * @returns Array of parsed page information
  */
 export async function parseParquetPage(
   columnChunkMetadata: ColumnChunk,
-  readByteRange: (offset: number, length: number) => Promise<ArrayBuffer>
+  readByteRange: (offset: number, length: number) => Promise<ArrayBuffer>,
+  fileSchema?: SchemaElement[]
 ): Promise<PageInfo[]> {
   const pages: PageInfo[] = []
 
@@ -507,6 +574,91 @@ export async function parseParquetPage(
     console.warn(`Failed to parse page data: ${columnChunkMetadata.meta_data?.path_in_schema.join('.')} page ${pageNumber}`, e)
   }
 
+  // Both OffsetIndex and ColumnIndex use data-page ordinals and deliberately
+  // exclude dictionary pages. Assign ordinals before enriching the pages.
+  let dataPageIndex = 0
+  for (const page of pages) {
+    if (page.pageType === 'DATA_PAGE' || page.pageType === 'DATA_PAGE_V2') {
+      page.dataPageIndex = dataPageIndex++
+    }
+  }
+
+  // OffsetIndex contains locations for data pages only (dictionary pages are
+  // deliberately omitted). Match by absolute page offset so page ordinals and
+  // first-row positions remain correct even when a dictionary page is present.
+  if (columnChunkMetadata.offset_index_offset !== undefined &&
+      columnChunkMetadata.offset_index_length !== undefined) {
+    try {
+      const offsetIndexBuffer = await readByteRange(
+        Number(columnChunkMetadata.offset_index_offset),
+        columnChunkMetadata.offset_index_length
+      )
+      const offsetIndexReader = {
+        view: new DataView(offsetIndexBuffer),
+        offset: 0,
+      }
+      const rawOffsetIndex = deserializeTCompactProtocol(offsetIndexReader) as {
+        field_1?: Array<{
+          field_1?: bigint
+          field_2?: number
+          field_3?: bigint
+        }>
+      }
+      const locationsByOffset = new Map(
+        (rawOffsetIndex.field_1 ?? []).map(location => [
+          location.field_1?.toString(),
+          location,
+        ])
+      )
+
+      for (const page of pages) {
+        if (page.pageType !== 'DATA_PAGE' && page.pageType !== 'DATA_PAGE_V2') {
+          continue
+        }
+
+        const location = locationsByOffset.get(page.offset?.toString())
+        if (location?.field_3 !== undefined) {
+          page.firstRowIndex = location.field_3
+        }
+        if (location?.field_2 !== undefined) {
+          page.offsetIndexCompressedSize = location.field_2
+        }
+      }
+    } catch (error) {
+      console.warn(
+        `Failed to parse offset index: ${columnChunkMetadata.meta_data?.path_in_schema.join('.')}`,
+        error
+      )
+    }
+  }
+
+  // ColumnIndex stores one statistics entry per data page. Entry i refers to
+  // OffsetIndex.page_locations[i], so it can be joined using dataPageIndex.
+  if (columnChunkMetadata.column_index_offset !== undefined &&
+      columnChunkMetadata.column_index_length !== undefined) {
+    try {
+      const columnIndexBuffer = await readByteRange(
+        Number(columnChunkMetadata.column_index_offset),
+        columnChunkMetadata.column_index_length
+      )
+      const columnIndexEntries = parseParquetColumnIndex(
+        columnIndexBuffer,
+        fileSchema,
+        colMeta.path_in_schema
+      )
+
+      for (const page of pages) {
+        const index = page.dataPageIndex
+        if (index !== undefined) page.columnIndex = columnIndexEntries[index]
+      }
+    } catch (error) {
+      console.warn(
+        `Failed to parse column index: ${columnChunkMetadata.meta_data?.path_in_schema.join('.')}`,
+        error
+      )
+    }
+  }
+
   // We never fall back. If this doesn't work, we fix the page parsing
 
   return pages
@@ -533,14 +685,7 @@ function parquetHeader(reader: { view: DataView; offset: number }) {
     encoding: Encoding[header.field_5.field_2 as number],
     definition_level_encoding: Encoding[header.field_5.field_3 as number],
     repetition_level_encoding: Encoding[header.field_5.field_4 as number],
-    statistics: header.field_5.field_5 && {
-      max: header.field_5.field_5.field_1,
-      min: header.field_5.field_5.field_2,
-      null_count: header.field_5.field_5.field_3,
-      distinct_count: header.field_5.field_5.field_4,
-      max_value: header.field_5.field_5.field_5,
-      min_value: header.field_5.field_5.field_6,
-    },
+    statistics: parsePageStatistics(header.field_5.field_5),
   }
 
   const index_page_header = header.field_6
@@ -559,7 +704,7 @@ function parquetHeader(reader: { view: DataView; offset: number }) {
     definition_levels_byte_length: header.field_8.field_5,
     repetition_levels_byte_length: header.field_8.field_6,
     is_compressed: header.field_8.field_7 === undefined ? true : header.field_8.field_7,
-    statistics: header.field_8.field_8,
+    statistics: parsePageStatistics(header.field_8.field_8),
   }
 
   return {
@@ -571,6 +716,21 @@ function parquetHeader(reader: { view: DataView; offset: number }) {
     index_page_header,
     dictionary_page_header,
     data_page_header_v2,
+  }
+}
+
+function parsePageStatistics(statistics: any): Statistics | undefined {
+  if (!statistics) return undefined
+
+  return {
+    max: statistics.field_1,
+    min: statistics.field_2,
+    null_count: statistics.field_3,
+    distinct_count: statistics.field_4,
+    max_value: statistics.field_5,
+    min_value: statistics.field_6,
+    is_max_value_exact: statistics.field_7,
+    is_min_value_exact: statistics.field_8,
   }
 }
 
@@ -756,6 +916,51 @@ export function decompressPageData(
   // For other codecs, we would need additional libraries
   // For now, throw an error indicating unsupported codec
   throw new Error(`Decompression for codec ${codec} is not yet supported. Supported codecs: UNCOMPRESSED, SNAPPY, ZSTD`)
+}
+
+/**
+ * Decompress a complete page payload according to its page version.
+ *
+ * DATA_PAGE_V2 stores repetition and definition levels uncompressed at the
+ * beginning of the payload and optionally compresses only the encoded values.
+ * Other page types compress the complete payload as one unit.
+ */
+export function decompressPagePayload(
+  pageInfo: PageInfo,
+  compressedData: ArrayBuffer,
+  codec: string
+): Uint8Array {
+  const compressedBytes = new Uint8Array(compressedData)
+  const uncompressedSize = pageInfo.uncompressedSize ?? compressedBytes.byteLength
+
+  if (!pageInfo.dataPageHeaderV2) {
+    return decompressPageData(compressedData, uncompressedSize, codec)
+  }
+
+  const levelBytes =
+    pageInfo.dataPageHeaderV2.repetition_levels_byte_length +
+    pageInfo.dataPageHeaderV2.definition_levels_byte_length
+
+  if (levelBytes > compressedBytes.byteLength || levelBytes > uncompressedSize) {
+    throw new Error(
+      `Invalid DATA_PAGE_V2 level lengths: ${levelBytes} bytes for a ${compressedBytes.byteLength}-byte payload`
+    )
+  }
+
+  if (pageInfo.dataPageHeaderV2.is_compressed === false) {
+    return compressedBytes
+  }
+
+  const compressedValues = compressedBytes.slice(levelBytes)
+  const uncompressedValues = decompressPageData(
+    compressedValues.buffer,
+    uncompressedSize - levelBytes,
+    codec
+  )
+  const result = new Uint8Array(levelBytes + uncompressedValues.byteLength)
+  result.set(compressedBytes.subarray(0, levelBytes), 0)
+  result.set(uncompressedValues, levelBytes)
+  return result
 }
 
 /**
@@ -987,7 +1192,6 @@ export async function parseColumnChunkPageSizes(
     const pageOffset = Number(page.offset)
     const headerSize = page.headerSize || 0
     const compressedSize = page.compressedSize || 0
-    const uncompressedSize = page.uncompressedSize || compressedSize
 
     // Read the compressed page data (after header)
     const compressedData = await readByteRange(
@@ -995,20 +1199,7 @@ export async function parseColumnChunkPageSizes(
       compressedSize
     )
 
-    // Decompress the page data
-    // For DATA_PAGE_V2, check the is_compressed flag
-    let uncompressedBytes: Uint8Array
-    if (page.dataPageHeaderV2 && page.dataPageHeaderV2.is_compressed === false) {
-      // Data is already uncompressed
-      uncompressedBytes = new Uint8Array(compressedData)
-    } else {
-      // Normal decompression based on codec
-      uncompressedBytes = decompressPageData(
-        compressedData,
-        uncompressedSize,
-        codec
-      )
-    }
+    const uncompressedBytes = decompressPagePayload(page, compressedData, codec)
 
     // Parse the page data sizes
     const sizeBreakdown = parsePageDataSizes(

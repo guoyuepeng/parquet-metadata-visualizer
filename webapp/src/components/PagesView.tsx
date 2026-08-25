@@ -1,7 +1,106 @@
 import { useState, useEffect } from 'react'
 import type { ParquetPageMetadata, PageInfo, PageSizeBreakdown } from '../../../src/lib/parquet-parsing'
-import { parseParquetPage, parsePageDataSizes, calculateMaxLevels, decompressPageData } from '../../../src/lib/parquet-parsing'
+import { parseParquetPage, parsePageDataSizes, calculateMaxLevels, decompressPagePayload } from '../../../src/lib/parquet-parsing'
 import './PagesView.css'
+
+type PageStatistics = NonNullable<NonNullable<PageInfo['dataPageHeader']>['statistics']>
+
+function formatBytes(value: number | bigint | undefined): string {
+  return value === undefined ? 'Not available' : `${value.toLocaleString()} bytes`
+}
+
+function formatOffset(value: number | bigint | undefined): string {
+  return value === undefined ? 'Not available' : value.toLocaleString()
+}
+
+function formatCrc(value: number | undefined): string {
+  if (value === undefined) return 'Not present'
+  return `0x${(value >>> 0).toString(16).padStart(8, '0').toUpperCase()}`
+}
+
+function formatMetadataValue(value: unknown): string {
+  if (value === undefined || value === null) return 'Not present'
+  if (typeof value === 'bigint' || typeof value === 'number') return value.toLocaleString()
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No'
+  if (typeof value === 'string') return value
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? String(value) : value.toISOString()
+
+  if (value instanceof Uint8Array) {
+    const limit = 24
+    const bytes = Array.from(value.subarray(0, limit))
+      .map(byte => byte.toString(16).padStart(2, '0'))
+      .join(' ')
+    return `0x${bytes}${value.byteLength > limit ? ' …' : ''} (${value.byteLength} bytes)`
+  }
+
+  return String(value)
+}
+
+function pageKindLabel(pageType?: string): string {
+  if (pageType === 'DICTIONARY_PAGE') return 'Dictionary page'
+  if (pageType === 'DATA_PAGE') return 'Data page V1'
+  if (pageType === 'DATA_PAGE_V2') return 'Data page V2'
+  if (pageType === 'INDEX_PAGE') return 'Index page'
+  return 'Unknown page type'
+}
+
+function MetadataField({ label, value, wide = false }: { label: string; value: string; wide?: boolean }) {
+  return (
+    <div className={`page-metadata-field${wide ? ' wide' : ''}`}>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  )
+}
+
+function PageStatisticsDetails({ statistics }: { statistics?: PageStatistics }) {
+  if (!statistics) return null
+
+  const fields = [
+    ['Null count', statistics.null_count],
+    ['Distinct count', statistics.distinct_count],
+    ['Minimum', statistics.min_value ?? statistics.min],
+    ['Maximum', statistics.max_value ?? statistics.max],
+    ['Minimum exact', statistics.is_min_value_exact],
+    ['Maximum exact', statistics.is_max_value_exact],
+  ].filter(([, value]) => value !== undefined)
+
+  if (fields.length === 0) return null
+
+  return (
+    <div className="page-specific-block page-statistics-block">
+      <h5>Page-header statistics</h5>
+      <dl className="page-metadata-grid compact">
+        {fields.map(([label, value]) => (
+          <MetadataField key={String(label)} label={String(label)} value={formatMetadataValue(value)} />
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function ColumnIndexDetails({ page }: { page: PageInfo }) {
+  const entry = page.columnIndex
+  if (!entry) return null
+
+  return (
+    <div className="page-specific-block column-index-statistics-block">
+      <h5>ColumnIndex statistics</h5>
+      <dl className="page-metadata-grid compact">
+        <MetadataField label="Index entry" value={entry.index.toLocaleString()} />
+        <MetadataField label="Null-only page" value={entry.nullPage ? 'Yes' : 'No'} />
+        <MetadataField label="Minimum bound" value={formatMetadataValue(entry.min)} />
+        <MetadataField label="Maximum bound" value={formatMetadataValue(entry.max)} />
+        <MetadataField label="Null count" value={formatMetadataValue(entry.nullCount)} />
+        {entry.nanCount !== undefined && (
+          <MetadataField label="NaN count" value={formatMetadataValue(entry.nanCount)} />
+        )}
+        <MetadataField label="Boundary order" value={entry.boundaryOrder} />
+        <MetadataField label="Statistics source" value="ColumnIndex" />
+      </dl>
+    </div>
+  )
+}
 
 interface PagesViewProps {
   metadata: ParquetPageMetadata
@@ -17,6 +116,7 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
   const [pages, setPages] = useState<PageInfo[]>([])
   const [pageSizeBreakdowns, setPageSizeBreakdowns] = useState<PageSizeBreakdown[]>([])
   const [isLoadingPages, setIsLoadingPages] = useState(false)
+  const [pageLoadError, setPageLoadError] = useState<string | null>(null)
 
   // Update selection when initial values change
   useEffect(() => {
@@ -30,6 +130,10 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
 
   const currentRowGroup = rowGroups[selectedRowGroup]
   const currentColumn = selectedColumn !== null ? currentRowGroup?.columns[selectedColumn] : null
+  const currentRawColumnChunk = selectedColumn !== null
+    ? metadata.fileMetadata.rowGroups[selectedRowGroup]?.columns[selectedColumn]
+    : null
+  const currentRawColumnMetadata = currentRawColumnChunk?.meta_data
 
   // Load pages when column is selected
   useEffect(() => {
@@ -37,6 +141,9 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
 
     const loadPages = async () => {
       setIsLoadingPages(true)
+      setPageLoadError(null)
+      setPages([])
+      setPageSizeBreakdowns([])
       try {
         const rawColumnChunk = metadata.fileMetadata.rowGroups[selectedRowGroup].columns[selectedColumn];
         const columnMetadata = rawColumnChunk.meta_data!!; // assume not undefined
@@ -44,7 +151,11 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
           const slice = file.slice(offset, offset + length)
           return await slice.arrayBuffer()
         }
-        const parsedPages = await parseParquetPage(rawColumnChunk, byteRangeReader)
+        const parsedPages = await parseParquetPage(
+          rawColumnChunk,
+          byteRangeReader,
+          metadata.fileMetadata.schema
+        )
         setPages(parsedPages)
 
         // Calculate max levels for this column
@@ -64,25 +175,11 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
             const pageOffset = Number(page.offset)
             const headerSize = page.headerSize || 0
             const compressedSize = page.compressedSize || 0
-            const uncompressedSize = page.uncompressedSize || compressedSize
 
             // Read the compressed page data (after header)
             const compressedData = await byteRangeReader(pageOffset + headerSize, compressedSize)
 
-            // Decompress the page data
-            // For DATA_PAGE_V2, check the is_compressed flag
-            let uncompressedBytes: Uint8Array
-            if (page.dataPageHeaderV2 && page.dataPageHeaderV2.is_compressed === false) {
-              // Data is already uncompressed
-              uncompressedBytes = new Uint8Array(compressedData)
-            } else {
-              // Normal decompression based on codec
-              uncompressedBytes = decompressPageData(
-                compressedData,
-                uncompressedSize,
-                codec
-              )
-            }
+            const uncompressedBytes = decompressPagePayload(page, compressedData, codec)
 
             // Parse the page data sizes
             const breakdown = parsePageDataSizes(
@@ -99,6 +196,7 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
         setPageSizeBreakdowns(breakdowns)
       } catch (error) {
         console.error('Error loading pages:', error)
+        setPageLoadError(error instanceof Error ? error.message : String(error))
         setPages([])
         setPageSizeBreakdowns([])
       } finally {
@@ -108,6 +206,25 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
 
     loadPages()
   }, [selectedRowGroup, selectedColumn, currentColumn, metadata.fileMetadata, file])
+
+  const pageBreakdownsByNumber = new Map(
+    pageSizeBreakdowns.map(breakdown => [breakdown.pageNumber, breakdown])
+  )
+  const dictionaryPageCount = pages.filter(page => page.pageType === 'DICTIONARY_PAGE').length
+  const dataPageCount = pages.filter(
+    page => page.pageType === 'DATA_PAGE' || page.pageType === 'DATA_PAGE_V2'
+  ).length
+  const totalPageHeaderBytes = pages.reduce((sum, page) => sum + (page.headerSize ?? 0), 0)
+  const totalParsedOnDiskBytes = pages.reduce(
+    (sum, page) => sum + (page.headerSize ?? 0) + (page.compressedSize ?? 0),
+    0
+  )
+  const chunkStart = currentRawColumnMetadata
+    ? Number(currentRawColumnMetadata.dictionary_page_offset ?? currentRawColumnMetadata.data_page_offset)
+    : undefined
+  const chunkEnd = chunkStart !== undefined && currentRawColumnMetadata
+    ? chunkStart + Number(currentRawColumnMetadata.total_compressed_size)
+    : undefined
 
   return (
     <div className="pages-view">
@@ -141,6 +258,10 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
                   <span className="summary-value">{currentColumn.columnName}</span>
                 </div>
                 <div className="summary-item">
+                  <span className="summary-label">Row Group / Column:</span>
+                  <span className="summary-value">RG {selectedRowGroup} / Column {selectedColumn}</span>
+                </div>
+                <div className="summary-item">
                   <span className="summary-label">Physical Type:</span>
                   <span className="summary-value">{currentColumn.physicalType}</span>
                 </div>
@@ -155,6 +276,12 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
                   </span>
                 </div>
                 <div className="summary-item">
+                  <span className="summary-label">Data / Dictionary Pages:</span>
+                  <span className="summary-value">
+                    {isLoadingPages ? 'Loading...' : `${dataPageCount} / ${dictionaryPageCount}`}
+                  </span>
+                </div>
+                <div className="summary-item">
                   <span className="summary-label">Total Values:</span>
                   <span className="summary-value">{currentColumn.totalValues.toLocaleString()}</span>
                 </div>
@@ -162,6 +289,62 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
                   <span className="summary-label">Compressed Size:</span>
                   <span className="summary-value">
                     {currentColumn.totalCompressedSize.toLocaleString()} bytes
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Uncompressed Size:</span>
+                  <span className="summary-value">
+                    {currentColumn.totalUncompressedSize.toLocaleString()} bytes
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Column Chunk Range:</span>
+                  <span className="summary-value mono-value">
+                    {chunkStart === undefined || chunkEnd === undefined
+                      ? 'Not available'
+                      : `[${chunkStart.toLocaleString()}, ${chunkEnd.toLocaleString()})`}
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">First Data Page Offset:</span>
+                  <span className="summary-value mono-value">
+                    {formatOffset(currentRawColumnMetadata?.data_page_offset)}
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Dictionary Page Offset:</span>
+                  <span className="summary-value mono-value">
+                    {currentRawColumnMetadata?.dictionary_page_offset === undefined
+                      ? 'None'
+                      : formatOffset(currentRawColumnMetadata.dictionary_page_offset)}
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Offset Index:</span>
+                  <span className="summary-value mono-value">
+                    {currentRawColumnChunk?.offset_index_offset === undefined || currentRawColumnChunk.offset_index_length === undefined
+                      ? 'Not present'
+                      : `${currentRawColumnChunk.offset_index_offset.toLocaleString()} · ${currentRawColumnChunk.offset_index_length.toLocaleString()} bytes`}
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Column Index:</span>
+                  <span className="summary-value mono-value">
+                    {currentRawColumnChunk?.column_index_offset === undefined || currentRawColumnChunk.column_index_length === undefined
+                      ? 'Not present'
+                      : `${currentRawColumnChunk.column_index_offset.toLocaleString()} · ${currentRawColumnChunk.column_index_length.toLocaleString()} bytes`}
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Page Header Overhead:</span>
+                  <span className="summary-value">
+                    {isLoadingPages ? 'Loading...' : formatBytes(totalPageHeaderBytes)}
+                  </span>
+                </div>
+                <div className="summary-item">
+                  <span className="summary-label">Parsed On-Disk Bytes:</span>
+                  <span className="summary-value">
+                    {isLoadingPages ? 'Loading...' : formatBytes(totalParsedOnDiskBytes)}
                   </span>
                 </div>
                 <div className="summary-item">
@@ -175,6 +358,193 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
               </div>
             </div>
           </section>
+
+          {pageLoadError && (
+            <section className="pages-section page-error" role="alert">
+              <h3>Unable to parse pages</h3>
+              <p>{pageLoadError}</p>
+            </section>
+          )}
+
+          {!isLoadingPages && pages.length > 0 && (
+            <section className="pages-section">
+              <div className="section-title-row">
+                <div>
+                  <h3>Page Details</h3>
+                  <p className="section-helper-text">
+                    Every page is a Thrift header followed immediately by its payload. Data page payloads contain
+                    repetition levels, definition levels, and encoded values in that order. Dictionary pages are
+                    shown explicitly and are not part of the page indexes. When present, ColumnIndex bounds and null
+                    counts are joined to the corresponding data page below.
+                  </p>
+                </div>
+                <a
+                  className="format-doc-link"
+                  href="https://parquet.apache.org/docs/file-format/data-pages/"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Apache format reference ↗
+                </a>
+              </div>
+
+              <div className="page-details-list">
+                {pages.map(page => {
+                  const pageOffset = Number(page.offset ?? 0n)
+                  const headerSize = page.headerSize ?? 0
+                  const compressedPayloadSize = page.compressedSize ?? 0
+                  const uncompressedPayloadSize = page.uncompressedSize ?? compressedPayloadSize
+                  const payloadOffset = pageOffset + headerSize
+                  const totalOnDiskSize = headerSize + compressedPayloadSize
+                  const pageEnd = pageOffset + totalOnDiskSize
+                  const compressionRatio = compressedPayloadSize > 0
+                    ? uncompressedPayloadSize / compressedPayloadSize
+                    : 0
+                  const breakdown = pageBreakdownsByNumber.get(page.pageNumber)
+                  const statistics = page.dataPageHeader?.statistics ?? page.dataPageHeaderV2?.statistics
+                  const pageTypeClass = (page.pageType ?? 'UNKNOWN').toLowerCase()
+
+                  return (
+                    <article key={page.pageNumber} className={`page-card detailed ${pageTypeClass}`}>
+                      <header className="page-card-header">
+                        <div className="page-card-title">
+                          <span className="page-number">Page {page.pageNumber}</span>
+                          <span className={`page-type ${pageTypeClass}`}>{pageKindLabel(page.pageType)}</span>
+                          {page.encoding && <span className="page-encoding">{page.encoding}</span>}
+                        </div>
+                        <span className="page-range">[{pageOffset.toLocaleString()}, {pageEnd.toLocaleString()})</span>
+                      </header>
+
+                      <div className="page-byte-layout">
+                        <div className="page-layout-segment header-segment">
+                          <span>Page header</span>
+                          <strong>{formatBytes(headerSize)}</strong>
+                          <small>offset {pageOffset.toLocaleString()}</small>
+                        </div>
+                        <div className="page-layout-arrow" aria-hidden="true">→</div>
+                        <div className="page-layout-segment payload-segment">
+                          <span>Compressed payload</span>
+                          <strong>{formatBytes(compressedPayloadSize)}</strong>
+                          <small>offset {payloadOffset.toLocaleString()}</small>
+                        </div>
+                      </div>
+
+                      <dl className="page-metadata-grid">
+                        <MetadataField label="Header offset" value={formatOffset(page.offset)} />
+                        <MetadataField label="Header size" value={formatBytes(page.headerSize)} />
+                        <MetadataField label="Payload offset" value={payloadOffset.toLocaleString()} />
+                        <MetadataField label="Compressed payload" value={formatBytes(page.compressedSize)} />
+                        <MetadataField label="Uncompressed payload" value={formatBytes(page.uncompressedSize)} />
+                        <MetadataField label="Total on-disk size" value={formatBytes(totalOnDiskSize)} />
+                        <MetadataField
+                          label="Payload compression ratio"
+                          value={compressionRatio > 0 ? `${compressionRatio.toFixed(2)}x` : 'Not available'}
+                        />
+                        <MetadataField label="CRC32" value={formatCrc(page.crc)} />
+                        {page.offsetIndexCompressedSize !== undefined && (
+                          <MetadataField
+                            label="OffsetIndex page size"
+                            value={`${formatBytes(page.offsetIndexCompressedSize)}${page.offsetIndexCompressedSize === totalOnDiskSize ? ' · matches' : ' · differs'}`}
+                          />
+                        )}
+                        {page.firstRowIndex !== undefined && (
+                          <MetadataField label="First row from OffsetIndex" value={page.firstRowIndex.toLocaleString()} />
+                        )}
+                      </dl>
+
+                      {page.dictionaryPageHeader && (
+                        <div className="page-specific-block dictionary-metadata">
+                          <h5>Dictionary metadata</h5>
+                          <dl className="page-metadata-grid compact">
+                            <MetadataField
+                              label="Dictionary entries"
+                              value={page.dictionaryPageHeader.num_values.toLocaleString()}
+                            />
+                            <MetadataField label="Dictionary encoding" value={page.dictionaryPageHeader.encoding} />
+                            <MetadataField
+                              label="Entries sorted"
+                              value={page.dictionaryPageHeader.is_sorted === undefined
+                                ? 'Not specified'
+                                : page.dictionaryPageHeader.is_sorted ? 'Yes' : 'No'}
+                            />
+                            <MetadataField label="Position in chunk" value="First page" />
+                          </dl>
+                        </div>
+                      )}
+
+                      {page.dataPageHeader && (
+                        <div className="page-specific-block data-page-metadata">
+                          <h5>Data page V1 metadata</h5>
+                          <dl className="page-metadata-grid compact">
+                            <MetadataField label="Data page ordinal" value={(page.dataPageIndex ?? 0).toLocaleString()} />
+                            <MetadataField label="Values including nulls" value={page.dataPageHeader.num_values.toLocaleString()} />
+                            <MetadataField label="Value encoding" value={page.dataPageHeader.encoding} />
+                            <MetadataField label="Repetition-level encoding" value={page.dataPageHeader.repetition_level_encoding} />
+                            <MetadataField label="Definition-level encoding" value={page.dataPageHeader.definition_level_encoding} />
+                            <MetadataField label="Payload order" value="Repetition levels → Definition levels → Encoded values" wide />
+                          </dl>
+                        </div>
+                      )}
+
+                      {page.dataPageHeaderV2 && (
+                        <div className="page-specific-block data-page-v2-metadata">
+                          <h5>Data page V2 metadata</h5>
+                          <dl className="page-metadata-grid compact">
+                            <MetadataField label="Data page ordinal" value={(page.dataPageIndex ?? 0).toLocaleString()} />
+                            <MetadataField label="Rows" value={page.dataPageHeaderV2.num_rows.toLocaleString()} />
+                            <MetadataField label="Values including nulls" value={page.dataPageHeaderV2.num_values.toLocaleString()} />
+                            <MetadataField label="Null values" value={page.dataPageHeaderV2.num_nulls.toLocaleString()} />
+                            <MetadataField
+                              label="Non-null values"
+                              value={(page.dataPageHeaderV2.num_values - page.dataPageHeaderV2.num_nulls).toLocaleString()}
+                            />
+                            <MetadataField label="Value encoding" value={page.dataPageHeaderV2.encoding} />
+                            <MetadataField
+                              label="Repetition levels"
+                              value={`${formatBytes(page.dataPageHeaderV2.repetition_levels_byte_length)} · uncompressed`}
+                            />
+                            <MetadataField
+                              label="Definition levels"
+                              value={`${formatBytes(page.dataPageHeaderV2.definition_levels_byte_length)} · uncompressed`}
+                            />
+                            <MetadataField
+                              label="Values compressed"
+                              value={page.dataPageHeaderV2.is_compressed ? 'Yes' : 'No'}
+                            />
+                          </dl>
+                        </div>
+                      )}
+
+                      {breakdown && (
+                        <div className="page-specific-block page-payload-breakdown">
+                          <h5>{page.dictionaryPageHeader ? 'Dictionary payload' : 'Uncompressed payload breakdown'}</h5>
+                          <dl className="page-metadata-grid compact">
+                            {!page.dictionaryPageHeader && (
+                              <>
+                                <MetadataField label="Repetition levels" value={formatBytes(breakdown.repetitionLevelsSize)} />
+                                <MetadataField label="Definition levels" value={formatBytes(breakdown.definitionLevelsSize)} />
+                              </>
+                            )}
+                            <MetadataField
+                              label={page.dictionaryPageHeader ? 'Encoded dictionary values' : 'Encoded values'}
+                              value={formatBytes(breakdown.valuesSize)}
+                            />
+                            <MetadataField label="Total payload" value={formatBytes(breakdown.totalDataSize)} />
+                            {breakdown.nullCount !== undefined && (
+                              <MetadataField label="Decoded null count" value={breakdown.nullCount.toLocaleString()} />
+                            )}
+                          </dl>
+                        </div>
+                      )}
+
+                      <ColumnIndexDetails page={page} />
+                      <PageStatisticsDetails statistics={statistics} />
+                    </article>
+                  )
+                })}
+              </div>
+            </section>
+          )}
 
           {currentColumn.encodingStats && currentColumn.encodingStats.length > 0 && (
             <section className="pages-section">
@@ -412,11 +782,25 @@ function PagesView({ metadata, file, initialRowGroup, initialColumn }: PagesView
                               lines.push(`Values Count: ${page.numValues.toLocaleString()}`)
                             }
 
+                            if (page.columnIndex) {
+                              lines.push('')
+                              lines.push('--- ColumnIndex Statistics ---')
+                              lines.push(`Entry: ${page.columnIndex.index}`)
+                              lines.push(`Null-only page: ${page.columnIndex.nullPage ? 'Yes' : 'No'}`)
+                              lines.push(`Min: ${formatMetadataValue(page.columnIndex.min)}`)
+                              lines.push(`Max: ${formatMetadataValue(page.columnIndex.max)}`)
+                              lines.push(`Nulls: ${formatMetadataValue(page.columnIndex.nullCount)}`)
+                              if (page.columnIndex.nanCount !== undefined) {
+                                lines.push(`NaNs: ${formatMetadataValue(page.columnIndex.nanCount)}`)
+                              }
+                              lines.push(`Boundary order: ${page.columnIndex.boundaryOrder}`)
+                            }
+
                             // Add statistics from data page header
                             if (page.dataPageHeader?.statistics) {
                               const stats = page.dataPageHeader.statistics
                               lines.push('')
-                              lines.push('--- Statistics ---')
+                              lines.push('--- Page-header Statistics ---')
                               if (stats.null_count !== undefined) {
                                 lines.push(`Nulls: ${stats.null_count}`)
                               }
